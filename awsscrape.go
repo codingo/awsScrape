@@ -1,16 +1,21 @@
-
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net"
 	"net/http"
-	"strings"
+	"os"
 	"sync"
+	"time"
+
+	"golang.org/x/sync/errgroup"
 )
 
 type IPRange struct {
@@ -19,94 +24,99 @@ type IPRange struct {
 	} `json:"prefixes"`
 }
 
+const (
+	defaultTimeout = 10 * time.Second
+)
+
+var (
+	logger = log.New(os.Stdout, "", log.Ldate|log.Ltime|log.Lmicroseconds)
+
+	// Flags
+	keywordFlag = flag.String("keyword", "", "Keyword to search in SSL certificates")
+	timeoutFlag = flag.Duration("timeout", defaultTimeout, "Timeout for network operations")
+	threadsFlag = flag.Int("threads", 1, "Number of concurrent threads to use")
+)
+
+type CheckIPRangeError struct {
+	IPRange string
+	Err     error
+}
+
+func (e CheckIPRangeError) Error() string {
+	return fmt.Sprintf("error checking IP range %s: %v", e.IPRange, e.Err)
+}
+
 func main() {
-	keyword := flag.String("keyword", "", "Keyword to search in SSL certificates")
 	flag.Parse()
 
-	if *keyword == "" {
-		fmt.Println("Usage: go run script.go -keyword=<your_keyword>")
-		return
+	if *keywordFlag == "" {
+		fmt.Printf("Usage: %s -keyword=<your_keyword>\n", os.Args[0])
+		os.Exit(1)
 	}
 
+	ipRanges, err := getIPRanges()
+	if err != nil {
+		logger.Fatalf("Error fetching IP ranges: %v", err)
+	}
+
+	ipAddresses := &sync.Map{}
+	eg := &errgroup.Group{}
+	ctx, cancel := context.WithTimeout(context.Background(), *timeoutFlag)
+	defer cancel()
+
+	threadCount := *threadsFlag
+	if threadCount <= 0 {
+		threadCount = 1
+	}
+	rangeCount := len(ipRanges.Prefixes)
+	rangesPerThread := (rangeCount + threadCount - 1) / threadCount
+
+	for i := 0; i < rangeCount; i += rangesPerThread {
+		start := i
+		end := i + rangesPerThread
+		if end > rangeCount {
+			end = rangeCount
+		}
+		eg.Go(func() error {
+			for j := start; j < end; j++ {
+				err := checkIPRange(ctx, ipRanges.Prefixes[j].IPPrefix, *keywordFlag, ipAddresses)
+				if err != nil {
+					return CheckIPRangeError{ipRanges.Prefixes[j].IPPrefix, err}
+				}
+			}
+			return nil
+		})
+	}
+
+	if err := eg.Wait(); err != nil {
+		logger.Fatalf("%v", err)
+	}
+
+	ipAddresses.Range(func(key, value interface{}) bool {
+		logger.Printf("Keyword found in SSL certificate for IP: %s\n", key)
+		return true
+	})
+}
+
+func getIPRanges() (*IPRange, error) {
 	resp, err := http.Get("https://ip-ranges.amazonaws.com/ip-ranges.json")
 	if err != nil {
-		fmt.Println("Error fetching IP ranges:", err)
-		return
+		return nil, fmt.Errorf("error fetching IP ranges: %w", err)
 	}
 	defer resp.Body.Close()
 
 	data, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		fmt.Println("Error reading response body:", err)
-		return
+		return nil, fmt.Errorf("error reading IP ranges response body: %w", err)
 	}
 
-	var ipRanges IPRange
-	err = json.Unmarshal(data, &ipRanges)
-	if err != nil {
-		fmt.Println("Error parsing JSON:", err)
-		return
+	ipRanges := &IPRange{}
+	if err := json.Unmarshal(data, ipRanges); err != nil {
+		return nil, fmt.Errorf("error unmarshaling IP ranges: %w", err)
 	}
 
-	var wg sync.WaitGroup
-	ipChan := make(chan string)
-
-	for _, prefix := range ipRanges.Prefixes {
-		wg.Add(1)
-		go func(ipRange string) {
-			defer wg.Done()
-			checkIPRange(ipRange, *keyword, ipChan)
-		}(prefix.IPPrefix)
-	}
-
-	go func() {
-		wg.Wait()
-		close(ipChan)
-	}()
-
-	for ip := range ipChan {
-		fmt.Printf("Keyword found in SSL certificate for IP: %s\n", ip)
-	}
+	return ipRanges, nil
 }
 
-func checkIPRange(ipRange, keyword string, ipChan chan<- string) {
-	_, ipNet, err := net.ParseCIDR(ipRange)
-	if err != nil {
-		return
-	}
-
-	for ip := ipNet.IP.Mask(ipNet.Mask); ipNet.Contains(ip); incrementIP(ip) {
-		if checkSSLKeyword(ip.String(), keyword) {
-			ipChan <- ip.String()
-		}
-	}
-}
-
-func checkSSLKeyword(ip, keyword string) bool {
-	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 1e9}, "tcp", ip+":443", &tls.Config{InsecureSkipVerify: true})
-	if err != nil {
-		return false
-	}
-	defer conn.Close()
-
-	certs := conn.ConnectionState().PeerCertificates
-	if len(certs) > 0 {
-		subject := certs[0].Subject
-		if strings.Contains(subject.CommonName, keyword) ||
-			strings.Contains(strings.Join(subject.Organization, " "), keyword) ||
-			strings.Contains(strings.Join(subject.OrganizationalUnit, " "), keyword) {
-			return true
-		}
-	}
-
-	return false
-}
-
-func incrementIP(ip net.IP) {
-	for i := len(ip) - 1; i >= 0; i-- {
-		ip[i]++
-		if ip[i] != 0 {
-			break
-		}
-	}
-}
+func checkIPRange(ctx context.Context, ipRange, keyword string, ipAddresses *sync.Map) error {
+	ip, _,
